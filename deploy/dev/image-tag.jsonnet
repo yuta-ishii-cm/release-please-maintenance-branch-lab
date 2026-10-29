@@ -1,5 +1,5 @@
 local env = std.native('env');
-local defaultTag = 'v1.0.2'; // x-release-please-version
+local defaultTag = 'v1.0.3'; // x-release-please-version
 
 {
   tag: env('IMAGE_TAG', defaultTag),
