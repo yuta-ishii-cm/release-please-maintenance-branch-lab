@@ -1,0 +1,160 @@
+name: RELEASE_PLEASE
+
+# main（機能リリース）と保守ブランチ release/vX.Y（hotfix）の両方で release-please を動かす。
+# リリースPRのブランチ名は release-please--branches--<対象ブランチ> のため、ブランチ同士でぶつからない。
+on:
+  push:
+    branches:
+      - main
+      - 'release/v*'
+
+concurrency:
+  group: release-please-${{ github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        id: release
+        with:
+          target-branch: ${{ github.ref_name }}
+          # 保守ブランチでは patch だけを上げる設定を使う（main は minor を上げる）
+          config-file: ${{ startsWith(github.ref_name, 'release/') && 'release-please-config-maintenance.json' || 'release-please-config.json' }}
+          manifest-file: .release-please-manifest.json
+
+  # 機能リリース（vX.Y.0）: 保守ブランチ release/vX.Y を作り、旧保守ブランチ向けの修正候補PRを付け替える
+  open-maintenance-branch:
+    needs: release-please
+    if: github.ref_name == 'main' && needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.release-please.outputs.tag_name }}
+    steps:
+      - name: Create maintenance branch and retarget pull requests
+        run: |
+          branch="release/${TAG%.*}"
+          sha=$(gh api "repos/${GH_REPO}/commits/${TAG}" --jq .sha)
+          gh api "repos/${GH_REPO}/git/refs" -f ref="refs/heads/${branch}" -f sha="${sha}" > /dev/null
+
+          # リリースPR（release-please--）と同期PR（sync/）は、向き先の保守ブランチに紐づくため付け替えない
+          gh pr list --state open --json number,baseRefName,headRefName,headRefOid \
+            --jq ".[] | select(.baseRefName | startswith(\"release/\")) | select(.baseRefName != \"${branch}\")
+              | select(.headRefName | startswith(\"release-please--\") | not) | select(.headRefName | startswith(\"sync/\") | not)
+              | \"\(.number) \(.headRefOid)\"" |
+            while read -r number head_sha; do
+              gh pr edit "$number" --base "$branch"
+              gh api -X PUT "repos/${GH_REPO}/pulls/${number}/update-branch" -f expected_head_sha="$head_sha" > /dev/null ||
+                gh pr comment "$number" --body "${branch} を取り込めませんでした（コンフリクト）。手で解消してください。"
+            done
+
+  # 修正リリース（保守ブランチ）: 新しい保守ブランチと main に同期PRを作り、残りの修正候補に取り込む
+  sync:
+    needs: release-please
+    if: startsWith(github.ref_name, 'release/') && needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      BRANCH: ${{ github.ref_name }}
+      NEXT: ${{ needs.release-please.outputs.tag_name }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+
+      - name: Open sync pull requests
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          line="${NEXT%.*}"
+          version="${NEXT#v}"
+          newer=$(git for-each-ref --format='%(refname:lstrip=3)' 'refs/remotes/origin/release/v*' |
+            sort -V | awk -v cur="$BRANCH" 'found { print } $0 == cur { found = 1 }')
+
+          # バージョンだけが書かれたファイル（release-please が更新するもの）
+          version_files=(.release-please-manifest.json version.txt deploy/dev/image-tag.jsonnet deploy/pro/image-tag.jsonnet)
+          # CHANGELOG.md から今回のバージョンの節（次の「## [」の手前まで）を取り出す
+          section=$(git show "${NEXT}:CHANGELOG.md" |
+            awk -v head="## [${version}]" 'index($0, head) == 1 { p = 1 } p && /^## \[/ && index($0, head) != 1 { exit } p { print }')
+
+          for base in $newer main; do
+            sync="sync/${NEXT}-to-${base//\//-}"
+            note=""
+
+            # versionFile・CHANGELOG だけのコンフリクトは同期ブランチ側で解消する。
+            # versionFile は同期先と今回のうち新しいバージョン、CHANGELOG はバージョン順の位置に今回の節を差し込む
+            git switch -q --detach "origin/${base}"
+            if git merge -q --no-ff --no-edit "$NEXT"; then
+              git switch -q --detach "$NEXT"
+            else
+              conflicted=$(git diff --name-only --diff-filter=U)
+              others=$(grep -vxF -e CHANGELOG.md "${version_files[@]/#/-e}" <<< "$conflicted" || true)
+              if [ -z "$others" ]; then
+                base_version=$(git show "origin/${base}:version.txt")
+                kept=$(printf '%s\n%s\n' "$base_version" "$version" | sort -V | tail -n 1)
+                if [ "$kept" = "$version" ]; then
+                  git checkout --theirs -- "${version_files[@]}"
+                else
+                  git checkout --ours -- "${version_files[@]}"
+                fi
+                git show "origin/${base}:CHANGELOG.md" > CHANGELOG.ours
+                at=$(grep -n '^## \[' CHANGELOG.ours | while IFS=: read -r n header; do
+                  v=${header#'## ['}
+                  v=${v%%]*}
+                  v=${v#v}
+                  if [ "$v" != "$version" ] && [ "$(printf '%s\n%s\n' "$v" "$version" | sort -V | head -n 1)" = "$v" ]; then
+                    echo "$n"
+                    break
+                  fi
+                done)
+                if [ -n "$at" ]; then
+                  { head -n $((at - 1)) CHANGELOG.ours; printf '%s\n\n' "$section"; tail -n +"$at" CHANGELOG.ours; } > CHANGELOG.md
+                else
+                  { cat CHANGELOG.ours; printf '\n%s\n' "$section"; } > CHANGELOG.md
+                fi
+                rm CHANGELOG.ours
+                git add CHANGELOG.md "${version_files[@]}"
+                git commit -q --no-edit
+                note="versionFile・CHANGELOG.md のコンフリクトは自動で解消済みです（バージョンは ${kept}）。"
+              else
+                git merge --abort
+                git switch -q --detach "$NEXT"
+                note="次のファイルがコンフリクトしています。手で解消してください: $(tr '\n' ' ' <<< "$others")"
+              fi
+            fi
+            git push origin "HEAD:refs/heads/${sync}"
+
+            gh pr list --state open --base "$base" --json number,headRefName \
+              --jq ".[] | select(.headRefName | startswith(\"sync/${line}.\")) | .number" |
+              while read -r number; do
+                gh pr close "$number" --delete-branch --comment "${sync} の同期PRに置き換えるため、クローズします。"
+              done
+
+            gh pr create --base "$base" --head "$sync" \
+              --title "sync: ${NEXT} を ${base} に反映する" \
+              --body "保守ブランチ ${BRANCH} でリリースした ${NEXT} を ${base} に取り込みます。${note}"
+          done
+
+      - name: Update fix candidates
+        run: |
+          gh pr list --state open --base "$BRANCH" --json number,headRefName,headRefOid \
+            --jq '.[] | select(.headRefName | startswith("release-please--") | not) | "\(.number) \(.headRefOid)"' |
+            while read -r number sha; do
+              gh api -X PUT "repos/${GH_REPO}/pulls/${number}/update-branch" -f expected_head_sha="$sha" > /dev/null ||
+                gh pr comment "$number" --body "${NEXT} を取り込めませんでした（コンフリクト）。手で解消してください。"
+            done

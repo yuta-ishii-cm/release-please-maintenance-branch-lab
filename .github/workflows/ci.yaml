@@ -1,0 +1,11 @@
+name: CI
+
+# どのイベントで起動したかを観察するためのダミー
+on: [push]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - run: echo "event=${GITHUB_EVENT_NAME} ref=${GITHUB_REF} actor=${GITHUB_ACTOR} sha=${GITHUB_SHA}"
