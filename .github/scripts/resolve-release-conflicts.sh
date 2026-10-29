@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # マージ中のコンフリクトのうち、release-please が更新するファイルだけのものを解消して git add する。
 # - バージョンが書かれたファイル: 同期先と今回のリリースのうち、新しいバージョンの内容にする
-# - CHANGELOG.md: 同期先の内容の、今回より古いバージョンの最初の節の手前に、今回の節を差し込む
+# - CHANGELOG.md: 同期先の内容に、同期先に無い節をバージョン順の位置に差し込む
 #   （先頭に差し込むと、別系統の同期PRと同じ位置を書き換えるため、後からマージする側がコンフリクトする）
 # それ以外のファイルがコンフリクトしていれば、そのファイル名を出力して 1 を返す（呼び出し側で merge --abort する）。
 # 成功したら、残したバージョンを出力する。
@@ -30,29 +30,39 @@ for f in "${version_files[@]}"; do
   git show "${source_ref}:${f}" > "$f"
 done
 
-# CHANGELOG.md から今回のバージョンの節（次の「## [」の手前まで）を取り出す
-section=$(git show "${next_tag}:CHANGELOG.md" |
-  awk -v head="## [${version}]" 'index($0, head) == 1 { p = 1 } p && /^## \[/ && index($0, head) != 1 { exit } p { print }')
-git show "${base_ref}:CHANGELOG.md" > CHANGELOG.base
-if grep -qF "## [${version}]" CHANGELOG.base; then
-  cp CHANGELOG.base CHANGELOG.md
-else
-  at=$(grep -n '^## \[' CHANGELOG.base | while IFS=: read -r n header; do
-    v=${header#'## ['}
-    v=${v%%]*}
-    v=${v#v}
-    if [ "$v" != "$version" ] && [ "$(printf '%s\n%s\n' "$v" "$version" | sort -V | head -n 1)" = "$v" ]; then
+# 同期元の CHANGELOG.md にあって同期先に無い節を、すべて差し込む。
+# 同じ保守ブランチの古い同期PRを閉じて置き換えた場合、前のバージョンの節も同期先にまだ無いため
+git show "${next_tag}:CHANGELOG.md" > CHANGELOG.next
+git show "${base_ref}:CHANGELOG.md" > CHANGELOG.md
+grep '^## \[' CHANGELOG.next | while read -r header; do
+  v=${header#'## ['}
+  v=${v%%]*}
+  v=${v#v}
+  if grep -qE "^## \[v?${v//./\\.}\]" CHANGELOG.md; then
+    continue
+  fi
+  section=$(awk -v v="$v" '
+    function ver(line,   x) { x = substr(line, 5); sub(/\].*/, "", x); sub(/^v/, "", x); return x }
+    /^## / { if (p) exit; if (/^## \[/ && ver($0) == v) p = 1 }
+    p { print }' CHANGELOG.next)
+  # 今回より古いバージョンの最初の節の手前に差し込む（無ければ末尾）
+  at=$(grep -n '^## \[' CHANGELOG.md | while IFS=: read -r n line; do
+    w=${line#'## ['}
+    w=${w%%]*}
+    w=${w#v}
+    if [ "$(printf '%s\n%s\n' "$w" "$v" | sort -V | head -n 1)" = "$w" ]; then
       echo "$n"
       break
     fi
   done)
   if [ -n "$at" ]; then
-    { head -n $((at - 1)) CHANGELOG.base; printf '%s\n\n' "$section"; tail -n +"$at" CHANGELOG.base; } > CHANGELOG.md
+    { head -n $((at - 1)) CHANGELOG.md; printf '%s\n\n' "$section"; tail -n +"$at" CHANGELOG.md; } > CHANGELOG.tmp
   else
-    { cat CHANGELOG.base; printf '\n%s\n' "$section"; } > CHANGELOG.md
+    { cat CHANGELOG.md; printf '\n%s\n' "$section"; } > CHANGELOG.tmp
   fi
-fi
-rm CHANGELOG.base
+  mv CHANGELOG.tmp CHANGELOG.md
+done
+rm CHANGELOG.next
 
 git add CHANGELOG.md "${version_files[@]}"
 echo "$kept"
