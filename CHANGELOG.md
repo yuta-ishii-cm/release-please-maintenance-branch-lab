@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.1.1](https://github.com/yuta-ishii-cm/release-please-maintenance-branch-lab/compare/v1.1.0...v1.1.1) (2026-10-29)
+
+
+### Bug Fixes
+
+* 不具合Cを修正する（v1.0系向け） ([701106a](https://github.com/yuta-ishii-cm/release-please-maintenance-branch-lab/commit/701106ab72b61ae4b4d3af001293bd5067fe03cd))
+* 不具合Cを修正する（v1.0系向け） ([f4a603c](https://github.com/yuta-ishii-cm/release-please-maintenance-branch-lab/commit/f4a603c7f1cf0387b3a323edae941fe700caf4f4))
+* 不具合Dを修正する（v1.1系向け） ([#16](https://github.com/yuta-ishii-cm/release-please-maintenance-branch-lab/issues/16)) ([9f53743](https://github.com/yuta-ishii-cm/release-please-maintenance-branch-lab/commit/9f537438caa1a3a7553996b6a9883332715c3446))
+
 ## [1.1.0](https://github.com/yuta-ishii-cm/release-please-maintenance-branch-lab/compare/v1.0.0...v1.1.0) (2026-10-29)
 
 
